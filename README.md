@@ -41,6 +41,7 @@ Flow:
 - Optional UDP forwarding (one active peer socket on import side)
 - Session token pairing (`--session`)
 - Dev TLS auto-generation for QUIC relay (`--auto-tls`)
+- Optional direct peer-to-peer data path with relay signaling (`--data-path p2p`)
 
 ## Build
 
@@ -118,6 +119,40 @@ remote-access export --server RELAY_PUBLIC_IP:7844 --transport tcp --session my-
 remote-access import --server RELAY_PUBLIC_IP:7844 --transport tcp --session my-shared-session --listen 127.0.0.1:15432
 ```
 
+## Peer-to-peer data path (relay signaling)
+
+Use the relay for session signaling/pairing, then send tunnel traffic directly between peers.
+
+`import` must expose a reachable TCP socket for `export` to connect.
+
+```bash
+remote-access import \
+  --server RELAY_PUBLIC_IP:7844 \
+  --transport quic \
+  --trust-cert /path/to/ra-dev-cert.pem \
+  --session my-shared-session \
+  --data-path p2p \
+  --p2p-listen 0.0.0.0:39000 \
+  --p2p-advertise IMPORT_PUBLIC_IP:39000 \
+  --listen 127.0.0.1:15432
+```
+
+```bash
+remote-access export \
+  --server RELAY_PUBLIC_IP:7844 \
+  --transport quic \
+  --trust-cert /path/to/ra-dev-cert.pem \
+  --session my-shared-session \
+  --data-path p2p \
+  --to 127.0.0.1:5432
+```
+
+Notes:
+- Keep relay transport (`--transport`) open for signaling.
+- `--p2p-listen` is required on `import` when `--data-path p2p` is enabled.
+- If the address to announce differs from the local bind address, set `--p2p-advertise`.
+- If direct connection cannot be established before timeout, peers exit with an error.
+
 ## UDP forwarding
 
 Enable UDP forwarding by setting both sides:
@@ -191,6 +226,7 @@ Remember to allow UDP 7844 in cloud firewall + host firewall.
 - **Session not pairing**
   - ensure both sides use exact same `--session`.
   - ensure both sides agree on UDP enabled/disabled.
+  - ensure both sides use same `--data-path` setting.
 
 - **No traffic through tunnel**
   - verify `export --to` points to reachable local target.

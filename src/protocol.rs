@@ -16,6 +16,8 @@ pub enum MsgType {
     CloseStream = 5,
     TcpData = 6,
     UdpData = 7,
+    P2pOffer = 8,
+    P2pReady = 9,
 }
 
 impl MsgType {
@@ -28,6 +30,8 @@ impl MsgType {
             5 => Some(Self::CloseStream),
             6 => Some(Self::TcpData),
             7 => Some(Self::UdpData),
+            8 => Some(Self::P2pOffer),
+            9 => Some(Self::P2pReady),
             _ => None,
         }
     }
@@ -72,6 +76,10 @@ pub enum Message {
     UdpData {
         payload: Bytes,
     },
+    P2pOffer {
+        addr: String,
+    },
+    P2pReady,
 }
 
 fn put_string(buf: &mut BytesMut, s: &str) -> Result<()> {
@@ -127,6 +135,8 @@ impl Message {
                 }
                 body.put_slice(payload);
             }
+            Message::P2pOffer { addr } => put_string(&mut body, addr)?,
+            Message::P2pReady => {}
         }
 
         let ty = match self {
@@ -137,6 +147,8 @@ impl Message {
             Message::CloseStream { .. } => MsgType::CloseStream,
             Message::TcpData { .. } => MsgType::TcpData,
             Message::UdpData { .. } => MsgType::UdpData,
+            Message::P2pOffer { .. } => MsgType::P2pOffer,
+            Message::P2pReady => MsgType::P2pReady,
         };
 
         let len: u32 = body
@@ -233,6 +245,19 @@ impl Message {
             MsgType::UdpData => {
                 let payload = Bytes::copy_from_slice(cur);
                 Message::UdpData { payload }
+            }
+            MsgType::P2pOffer => {
+                let addr = get_string(&mut cur)?;
+                if !cur.is_empty() {
+                    return Err(anyhow!("trailing p2p_offer bytes"));
+                }
+                Message::P2pOffer { addr }
+            }
+            MsgType::P2pReady => {
+                if !cur.is_empty() {
+                    return Err(anyhow!("trailing p2p_ready bytes"));
+                }
+                Message::P2pReady
             }
         };
 

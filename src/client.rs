@@ -9,6 +9,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration};
 use tracing::{error, info, warn};
 
 use crate::framed::{FramedReader, FramedWriter};
@@ -103,6 +104,65 @@ pub async fn join_session(t: &Tunnel, session: &str, role: Role, want_udp: bool)
     }
 }
 
+pub async fn switch_export_to_p2p(relay_tunnel: Tunnel, timeout_secs: u64) -> Result<Tunnel> {
+    let offer_addr = match relay_tunnel.recv().await? {
+        Some(Message::P2pOffer { addr }) => addr,
+        Some(Message::AckErr(e)) => return Err(anyhow!("relay error: {e}")),
+        Some(m) => return Err(anyhow!("expected p2p offer, got {m:?}")),
+        None => return Err(anyhow!("relay closed before p2p offer")),
+    };
+    let offer_target: SocketAddr = offer_addr
+        .parse()
+        .with_context(|| format!("invalid p2p address from peer: {offer_addr}"))?;
+    let sock = timeout(
+        Duration::from_secs(timeout_secs),
+        TcpStream::connect(offer_target),
+    )
+    .await
+    .context("timed out connecting to p2p target")??;
+    relay_tunnel.send(&Message::P2pReady).await?;
+    let (r, w) = sock.into_split();
+    Ok(Tunnel {
+        inner: Arc::new(TunnelInner::Tcp {
+            r: Arc::new(Mutex::new(FramedReader::new(r))),
+            w: Arc::new(Mutex::new(FramedWriter::new(w))),
+        }),
+    })
+}
+
+pub async fn switch_import_to_p2p(
+    relay_tunnel: Tunnel,
+    p2p_listen: SocketAddr,
+    p2p_advertise: Option<SocketAddr>,
+    timeout_secs: u64,
+) -> Result<Tunnel> {
+    let listener = TcpListener::bind(p2p_listen)
+        .await
+        .with_context(|| format!("bind p2p listener on {p2p_listen}"))?;
+    let advertised = p2p_advertise.unwrap_or(listener.local_addr()?);
+    relay_tunnel
+        .send(&Message::P2pOffer {
+            addr: advertised.to_string(),
+        })
+        .await?;
+    match relay_tunnel.recv().await? {
+        Some(Message::P2pReady) => {}
+        Some(Message::AckErr(e)) => return Err(anyhow!("relay error: {e}")),
+        Some(m) => return Err(anyhow!("expected p2p ready, got {m:?}")),
+        None => return Err(anyhow!("relay closed before p2p ready")),
+    }
+    let (sock, _) = timeout(Duration::from_secs(timeout_secs), listener.accept())
+        .await
+        .context("timed out waiting for inbound p2p connection")??;
+    let (r, w) = sock.into_split();
+    Ok(Tunnel {
+        inner: Arc::new(TunnelInner::Tcp {
+            r: Arc::new(Mutex::new(FramedReader::new(r))),
+            w: Arc::new(Mutex::new(FramedWriter::new(w))),
+        }),
+    })
+}
+
 pub async fn run_export(
     tunnel: Tunnel,
     to: SocketAddr,
@@ -142,6 +202,8 @@ pub async fn run_export(
                 streams.lock().await.remove(&id);
             }
             Some(Message::UdpData { .. }) => {}
+            Some(Message::P2pOffer { .. }) => {}
+            Some(Message::P2pReady) => {}
             Some(other) => warn!("export ignoring {other:?}"),
         }
     }
@@ -223,6 +285,8 @@ async fn export_udp_loop(tunnel: Tunnel, target: SocketAddr) -> Result<()> {
                     Some(Message::CloseStream { .. }) => {}
                     Some(Message::TcpData { .. }) => {}
                     Some(Message::OpenStream { .. }) => {}
+                    Some(Message::P2pOffer { .. }) => {}
+                    Some(Message::P2pReady) => {}
                     Some(other) => warn!("udp export unexpected {other:?}"),
                 }
             }
@@ -266,6 +330,8 @@ pub async fn run_import(
                     streams_reader.lock().await.remove(&id);
                 }
                 Ok(Some(Message::UdpData { .. })) => {}
+                Ok(Some(Message::P2pOffer { .. })) => {}
+                Ok(Some(Message::P2pReady)) => {}
                 Ok(Some(other)) => warn!("import reader ignoring {other:?}"),
                 Ok(None) => break,
                 Err(e) => {
@@ -361,6 +427,8 @@ async fn import_udp_loop(tunnel: Tunnel, bind: SocketAddr) -> Result<()> {
                             let _ = sock_send.send_to(&payload, p).await;
                         }
                     }
+                    Some(Message::P2pOffer { .. }) => {}
+                    Some(Message::P2pReady) => {}
                     Some(other) => warn!("udp import unexpected {other:?}"),
                 }
             }

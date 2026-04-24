@@ -13,7 +13,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-use crate::client::{join_session, open_quic, open_tcp, run_export, run_import};
+use crate::client::{
+    join_session, open_quic, open_tcp, run_export, run_import, switch_export_to_p2p,
+    switch_import_to_p2p,
+};
 use crate::protocol::Role;
 use crate::relay::{run_quic, run_tcp};
 
@@ -21,6 +24,12 @@ use crate::relay::{run_quic, run_tcp};
 enum Transport {
     Quic,
     Tcp,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum DataPath {
+    Relay,
+    P2p,
 }
 
 #[derive(Parser)]
@@ -73,6 +82,12 @@ enum Cmd {
         /// TLS SNI / certificate hostname (QUIC). Defaults to IP string for numeric hosts.
         #[arg(long)]
         server_name: Option<String>,
+        /// Data path between peers after signaling.
+        #[arg(long, value_enum, default_value_t = DataPath::Relay)]
+        data_path: DataPath,
+        /// Timeout for establishing direct p2p path in seconds.
+        #[arg(long, default_value_t = 15)]
+        p2p_timeout_secs: u64,
     },
     /// Side that exposes a local TCP (and optional UDP) listener tunneled to export.
     Import {
@@ -92,6 +107,18 @@ enum Cmd {
         trust_cert: Option<PathBuf>,
         #[arg(long)]
         server_name: Option<String>,
+        /// Data path between peers after signaling.
+        #[arg(long, value_enum, default_value_t = DataPath::Relay)]
+        data_path: DataPath,
+        /// Local socket to accept direct p2p connection from export.
+        #[arg(long)]
+        p2p_listen: Option<SocketAddr>,
+        /// Address advertised over relay signaling for p2p.
+        #[arg(long)]
+        p2p_advertise: Option<SocketAddr>,
+        /// Timeout for establishing direct p2p path in seconds.
+        #[arg(long, default_value_t = 15)]
+        p2p_timeout_secs: u64,
     },
 }
 
@@ -129,9 +156,11 @@ async fn main() -> Result<()> {
             bind,
             trust_cert,
             server_name,
+            data_path,
+            p2p_timeout_secs,
         } => {
             let want_udp = udp_target.is_some();
-            let tunnel = match transport {
+            let relay_tunnel = match transport {
                 Transport::Tcp => open_tcp(server).await?,
                 Transport::Quic => {
                     let trust = trust_cert
@@ -140,7 +169,11 @@ async fn main() -> Result<()> {
                     open_quic(bind, server, &sn, &trust).await?
                 }
             };
-            join_session(&tunnel, &session, Role::Export, want_udp).await?;
+            join_session(&relay_tunnel, &session, Role::Export, want_udp).await?;
+            let tunnel = match data_path {
+                DataPath::Relay => relay_tunnel,
+                DataPath::P2p => switch_export_to_p2p(relay_tunnel, p2p_timeout_secs).await?,
+            };
             run_export(tunnel, to, udp_target).await?;
         }
         Cmd::Import {
@@ -152,9 +185,13 @@ async fn main() -> Result<()> {
             bind,
             trust_cert,
             server_name,
+            data_path,
+            p2p_listen,
+            p2p_advertise,
+            p2p_timeout_secs,
         } => {
             let want_udp = udp_listen.is_some();
-            let tunnel = match transport {
+            let relay_tunnel = match transport {
                 Transport::Tcp => open_tcp(server).await?,
                 Transport::Quic => {
                     let trust = trust_cert
@@ -163,7 +200,16 @@ async fn main() -> Result<()> {
                     open_quic(bind, server, &sn, &trust).await?
                 }
             };
-            join_session(&tunnel, &session, Role::Import, want_udp).await?;
+            join_session(&relay_tunnel, &session, Role::Import, want_udp).await?;
+            let tunnel = match data_path {
+                DataPath::Relay => relay_tunnel,
+                DataPath::P2p => {
+                    let listen_addr = p2p_listen
+                        .ok_or_else(|| anyhow!("--p2p-listen is required with --data-path p2p"))?;
+                    switch_import_to_p2p(relay_tunnel, listen_addr, p2p_advertise, p2p_timeout_secs)
+                        .await?
+                }
+            };
             run_import(tunnel, listen, udp_listen).await?;
         }
     }
