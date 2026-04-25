@@ -17,6 +17,8 @@ use crate::p2p_udp::{bind_and_discover, punch, ReliableUdp};
 use crate::protocol::{Message, Role};
 use crate::tls::quinn_client_config_trust;
 
+const TCP_TUNNEL_CHUNK: usize = 1024;
+
 pub enum TunnelInner {
     Tcp {
         r: Arc<Mutex<FramedReader<tokio::net::tcp::OwnedReadHalf>>>,
@@ -249,16 +251,22 @@ async fn export_one_tcp(
     id: u32,
     to: SocketAddr,
 ) -> Result<()> {
-    let (mut lr, mut lw) = TcpStream::connect(to).await?.into_split();
     let (tx_down, mut rx_down) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
     {
         let mut map = streams.lock().await;
         map.insert(id, tx_down);
     }
+    let (mut lr, mut lw) = match TcpStream::connect(to).await {
+        Ok(sock) => sock.into_split(),
+        Err(e) => {
+            streams.lock().await.remove(&id);
+            return Err(e.into());
+        }
+    };
 
     let tun_uplink = tunnel.clone();
     let uplink = async move {
-        let mut buf = vec![0u8; 64 * 1024];
+        let mut buf = vec![0u8; TCP_TUNNEL_CHUNK];
         loop {
             let n = lr.read(&mut buf).await?;
             if n == 0 {
@@ -384,9 +392,12 @@ pub async fn run_import(
     loop {
         let (sock, peer) = listener.accept().await?;
         let id = next_id.fetch_add(1, Ordering::Relaxed);
-        tunnel.send(&Message::OpenStream { id }).await?;
         let (tx_down, rx_down) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
         streams.lock().await.insert(id, tx_down);
+        if let Err(e) = tunnel.send(&Message::OpenStream { id }).await {
+            streams.lock().await.remove(&id);
+            return Err(e);
+        }
         let tun = tunnel.clone();
         let streams2 = streams.clone();
         tokio::spawn(async move {
@@ -407,7 +418,7 @@ async fn import_one_tcp(
     let (mut r, mut w) = sock.into_split();
     let tun_up = tunnel.clone();
     let uplink = async move {
-        let mut buf = vec![0u8; 64 * 1024];
+        let mut buf = vec![0u8; TCP_TUNNEL_CHUNK];
         loop {
             let n = r.read(&mut buf).await?;
             if n == 0 {
