@@ -133,7 +133,6 @@ remote-access import \
   --session my-shared-session \
   --data-path p2p \
   --p2p-listen 0.0.0.0:39000 \
-  --p2p-advertise IMPORT_PUBLIC_IP:39000 \
   --listen 127.0.0.1:15432
 ```
 
@@ -150,7 +149,8 @@ remote-access export \
 Notes:
 - Keep relay transport (`--transport`) open for signaling.
 - `--p2p-listen` is required on `import` when `--data-path p2p` is enabled.
-- If the address to announce differs from the local bind address, set `--p2p-advertise`.
+- When `--p2p-listen` binds an unspecified address such as `0.0.0.0:39000`, the relay advertises the import peer's relay-observed IP with that port.
+- If the address to announce differs from the relay-observed address, set `--p2p-advertise`.
 - If direct connection cannot be established before timeout, peers exit with an error.
 
 ## UDP forwarding

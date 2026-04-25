@@ -13,8 +13,8 @@ use crate::protocol::{Message, Role};
 use crate::tls::{generate_ephemeral_cert_files, quinn_server_config};
 
 pub(crate) struct Pending {
-    export: Option<AnyFramed>,
-    import: Option<AnyFramed>,
+    export: Option<Peer>,
+    import: Option<Peer>,
     want_udp: Option<bool>,
 }
 
@@ -30,13 +30,32 @@ impl Pending {
 
 pub(crate) type SessionMap = Mutex<HashMap<String, Pending>>;
 
-async fn bridge_pair(mut a: AnyFramed, mut b: AnyFramed) {
+pub(crate) struct Peer {
+    framed: AnyFramed,
+    observed_addr: SocketAddr,
+}
+
+fn maybe_rewrite_p2p_offer(msg: Message, observed_addr: SocketAddr) -> Message {
+    let Message::P2pOffer { addr } = msg else {
+        return msg;
+    };
+
+    match addr.parse::<SocketAddr>() {
+        Ok(offered) if offered.ip().is_unspecified() => Message::P2pOffer {
+            addr: SocketAddr::new(observed_addr.ip(), offered.port()).to_string(),
+        },
+        _ => Message::P2pOffer { addr },
+    }
+}
+
+async fn bridge_pair(mut a: Peer, mut b: Peer) {
     loop {
         tokio::select! {
-            ra = a.recv() => {
+            ra = a.framed.recv() => {
                 match ra {
                     Ok(Some(m)) => {
-                        if b.send(&m).await.is_err() {
+                        let m = maybe_rewrite_p2p_offer(m, a.observed_addr);
+                        if b.framed.send(&m).await.is_err() {
                             break;
                         }
                     }
@@ -47,10 +66,11 @@ async fn bridge_pair(mut a: AnyFramed, mut b: AnyFramed) {
                     }
                 }
             }
-            rb = b.recv() => {
+            rb = b.framed.recv() => {
                 match rb {
                     Ok(Some(m)) => {
-                        if a.send(&m).await.is_err() {
+                        let m = maybe_rewrite_p2p_offer(m, b.observed_addr);
+                        if a.framed.send(&m).await.is_err() {
                             break;
                         }
                     }
@@ -71,6 +91,7 @@ async fn handle_session_pair(
     role: Role,
     want_udp: bool,
     framed: AnyFramed,
+    observed_addr: SocketAddr,
 ) -> Result<()> {
     let (peer_a, peer_b) = {
         let mut map = sessions.lock().await;
@@ -100,7 +121,10 @@ async fn handle_session_pair(
                         .await;
                     return Err(anyhow!("duplicate export"));
                 }
-                entry.export = Some(framed);
+                entry.export = Some(Peer {
+                    framed,
+                    observed_addr,
+                });
             }
             Role::Import => {
                 if entry.import.is_some() {
@@ -112,7 +136,10 @@ async fn handle_session_pair(
                         .await;
                     return Err(anyhow!("duplicate import"));
                 }
-                entry.import = Some(framed);
+                entry.import = Some(Peer {
+                    framed,
+                    observed_addr,
+                });
             }
         }
 
@@ -128,17 +155,23 @@ async fn handle_session_pair(
     };
     let (mut peer_a, mut peer_b) = (peer_a, peer_b);
 
-    peer_a.send(&Message::AckOk).await.context("ack export")?;
-    peer_b.send(&Message::AckOk).await.context("ack import")?;
+    peer_a
+        .framed
+        .send(&Message::AckOk)
+        .await
+        .context("ack export")?;
+    peer_b
+        .framed
+        .send(&Message::AckOk)
+        .await
+        .context("ack import")?;
     info!(%session, "paired; bridging");
     bridge_pair(peer_a, peer_b).await;
     Ok(())
 }
 
-async fn serve_one_tcp(
-    sock: TcpStream,
-    sessions: Arc<SessionMap>,
-) -> Result<()> {
+async fn serve_one_tcp(sock: TcpStream, sessions: Arc<SessionMap>) -> Result<()> {
+    let observed_addr = sock.peer_addr().context("tcp peer addr")?;
     let (r, w) = sock.into_split();
     let mut framed = AnyFramed::Tcp(FramedRw::new(r, w));
     let join = match framed.recv().await? {
@@ -158,13 +191,11 @@ async fn serve_one_tcp(
 
     let (role, session, want_udp) = join;
     if session.is_empty() {
-        let _ = framed
-            .send(&Message::AckErr("empty session".into()))
-            .await;
+        let _ = framed.send(&Message::AckErr("empty session".into())).await;
         return Err(anyhow!("empty session"));
     }
 
-    handle_session_pair(sessions, session, role, want_udp, framed).await
+    handle_session_pair(sessions, session, role, want_udp, framed, observed_addr).await
 }
 
 pub async fn run_tcp(addr: SocketAddr, sessions: Arc<SessionMap>) -> Result<()> {
@@ -223,9 +254,7 @@ pub async fn run_quic(
                     }) => (role, session, want_udp),
                     Some(other) => {
                         let _ = framed
-                            .send(&Message::AckErr(format!(
-                                "expected join, got {other:?}"
-                            )))
+                            .send(&Message::AckErr(format!("expected join, got {other:?}")))
                             .await;
                         return Err(anyhow!("bad first message"));
                     }
@@ -233,12 +262,10 @@ pub async fn run_quic(
                 };
                 let (role, session, want_udp) = join;
                 if session.is_empty() {
-                    let _ = framed
-                        .send(&Message::AckErr("empty session".into()))
-                        .await;
+                    let _ = framed.send(&Message::AckErr("empty session".into())).await;
                     return Err(anyhow!("empty session"));
                 }
-                handle_session_pair(sessions, session, role, want_udp, framed).await
+                handle_session_pair(sessions, session, role, want_udp, framed, peer).await
             }
             .await;
             if let Err(e) = res {
