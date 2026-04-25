@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -33,6 +33,17 @@ pub(crate) type SessionMap = Mutex<HashMap<String, Pending>>;
 pub(crate) struct Peer {
     framed: AnyFramed,
     observed_addr: SocketAddr,
+}
+
+pub async fn run_udp_discovery(addr: SocketAddr) -> Result<()> {
+    let sock = UdpSocket::bind(addr).await?;
+    info!(%addr, "relay listening (UDP p2p discovery)");
+    let mut buf = [0u8; 64];
+    loop {
+        let (_, peer) = sock.recv_from(&mut buf).await?;
+        let reply = peer.to_string();
+        let _ = sock.send_to(reply.as_bytes(), peer).await;
+    }
 }
 
 fn maybe_rewrite_p2p_offer(msg: Message, observed_addr: SocketAddr) -> Message {

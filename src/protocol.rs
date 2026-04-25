@@ -18,6 +18,9 @@ pub enum MsgType {
     UdpData = 7,
     P2pOffer = 8,
     P2pReady = 9,
+    P2pCandidate = 10,
+    P2pSelected = 11,
+    P2pFailed = 12,
 }
 
 impl MsgType {
@@ -32,6 +35,9 @@ impl MsgType {
             7 => Some(Self::UdpData),
             8 => Some(Self::P2pOffer),
             9 => Some(Self::P2pReady),
+            10 => Some(Self::P2pCandidate),
+            11 => Some(Self::P2pSelected),
+            12 => Some(Self::P2pFailed),
             _ => None,
         }
     }
@@ -54,7 +60,7 @@ impl Role {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Message {
     Join {
         role: Role,
@@ -80,6 +86,15 @@ pub enum Message {
         addr: String,
     },
     P2pReady,
+    P2pCandidate {
+        addr: String,
+    },
+    P2pSelected {
+        addr: String,
+    },
+    P2pFailed {
+        reason: String,
+    },
 }
 
 fn put_string(buf: &mut BytesMut, s: &str) -> Result<()> {
@@ -137,6 +152,9 @@ impl Message {
             }
             Message::P2pOffer { addr } => put_string(&mut body, addr)?,
             Message::P2pReady => {}
+            Message::P2pCandidate { addr } => put_string(&mut body, addr)?,
+            Message::P2pSelected { addr } => put_string(&mut body, addr)?,
+            Message::P2pFailed { reason } => put_string(&mut body, reason)?,
         }
 
         let ty = match self {
@@ -149,6 +167,9 @@ impl Message {
             Message::UdpData { .. } => MsgType::UdpData,
             Message::P2pOffer { .. } => MsgType::P2pOffer,
             Message::P2pReady => MsgType::P2pReady,
+            Message::P2pCandidate { .. } => MsgType::P2pCandidate,
+            Message::P2pSelected { .. } => MsgType::P2pSelected,
+            Message::P2pFailed { .. } => MsgType::P2pFailed,
         };
 
         let len: u32 = body
@@ -259,8 +280,54 @@ impl Message {
                 }
                 Message::P2pReady
             }
+            MsgType::P2pCandidate => {
+                let addr = get_string(&mut cur)?;
+                if !cur.is_empty() {
+                    return Err(anyhow!("trailing p2p_candidate bytes"));
+                }
+                Message::P2pCandidate { addr }
+            }
+            MsgType::P2pSelected => {
+                let addr = get_string(&mut cur)?;
+                if !cur.is_empty() {
+                    return Err(anyhow!("trailing p2p_selected bytes"));
+                }
+                Message::P2pSelected { addr }
+            }
+            MsgType::P2pFailed => {
+                let reason = get_string(&mut cur)?;
+                if !cur.is_empty() {
+                    return Err(anyhow!("trailing p2p_failed bytes"));
+                }
+                Message::P2pFailed { reason }
+            }
         };
 
         Ok(Some(msg))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(msg: Message) {
+        let mut encoded = BytesMut::new();
+        msg.encode(&mut encoded).unwrap();
+        assert_eq!(Message::decode(&mut encoded).unwrap(), Some(msg));
+        assert!(encoded.is_empty());
+    }
+
+    #[test]
+    fn roundtrips_p2p_signaling() {
+        roundtrip(Message::P2pCandidate {
+            addr: "203.0.113.10:49152".to_string(),
+        });
+        roundtrip(Message::P2pSelected {
+            addr: "203.0.113.10:49152".to_string(),
+        });
+        roundtrip(Message::P2pFailed {
+            reason: "timeout".to_string(),
+        });
     }
 }

@@ -41,7 +41,7 @@ Flow:
 - Optional UDP forwarding (one active peer socket on import side)
 - Session token pairing (`--session`)
 - Dev TLS auto-generation for QUIC relay (`--auto-tls`)
-- Optional direct peer-to-peer data path with relay signaling (`--data-path p2p`)
+- Optional UDP hole-punched peer-to-peer data path with relay fallback (`--data-path p2p`)
 
 ## Build
 
@@ -79,7 +79,7 @@ remote-access server \
 
 This writes `ra-dev-cert.pem` and `ra-dev-key.pem` in the working directory (if missing).
 
-Open firewall/security group for **UDP 7844**.
+Open firewall/security group for **UDP 7844** and **UDP 7845**.
 
 ### 2) Start export peer (private machine with target service)
 
@@ -121,9 +121,9 @@ remote-access import --server RELAY_PUBLIC_IP:7844 --transport tcp --session my-
 
 ## Peer-to-peer data path (relay signaling)
 
-Use the relay for session signaling/pairing, then send tunnel traffic directly between peers.
+Use the relay for session signaling/pairing and UDP address discovery, then try to send tunnel traffic directly between peers.
 
-`import` must expose a reachable TCP socket for `export` to connect.
+If UDP hole punching fails, peers automatically continue over the relay.
 
 ```bash
 remote-access import \
@@ -132,7 +132,6 @@ remote-access import \
   --trust-cert /path/to/ra-dev-cert.pem \
   --session my-shared-session \
   --data-path p2p \
-  --p2p-listen 0.0.0.0:39000 \
   --listen 127.0.0.1:15432
 ```
 
@@ -148,10 +147,10 @@ remote-access export \
 
 Notes:
 - Keep relay transport (`--transport`) open for signaling.
-- `--p2p-listen` is required on `import` when `--data-path p2p` is enabled.
-- When `--p2p-listen` binds an unspecified address such as `0.0.0.0:39000`, the relay advertises the import peer's relay-observed IP with that port.
-- If the address to announce differs from the relay-observed address, set `--p2p-advertise`.
-- If direct connection cannot be established before timeout, peers exit with an error.
+- The relay also listens on UDP `7845` by default for p2p address discovery (`--p2p-discovery-listen`).
+- Peers use `--p2p-bind 0.0.0.0:0` by default. Set it only if you need a fixed local UDP bind.
+- Peers derive the discovery endpoint as `RELAY_PUBLIC_IP:7845` by default. Override with `--p2p-discovery-server`.
+- UDP hole punching works for many NATs, including some CGNAT paths, but not all. Failed punching falls back to relayed tunnel traffic.
 
 ## UDP forwarding
 
@@ -205,7 +204,7 @@ Environment=RUST_LOG=info
 WantedBy=multi-user.target
 ```
 
-Remember to allow UDP 7844 in cloud firewall + host firewall.
+Remember to allow UDP 7844 and UDP 7845 in cloud firewall + host firewall.
 
 ## Security notes
 
@@ -237,4 +236,5 @@ Remember to allow UDP 7844 in cloud firewall + host firewall.
 - No authentication beyond session token pairing.
 - Relay keeps session pairing state in-memory.
 - UDP mode currently maps to one active remote peer socket on import side.
+- P2P mode uses internal UDP hole punching, not standards-compatible ICE/STUN/TURN.
 

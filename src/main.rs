@@ -1,5 +1,6 @@
 mod client;
 mod framed;
+mod p2p_udp;
 mod protocol;
 mod relay;
 mod tls;
@@ -11,14 +12,12 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use tokio::sync::Mutex;
+use tracing::error;
 use tracing_subscriber::EnvFilter;
 
-use crate::client::{
-    join_session, open_quic, open_tcp, run_export, run_import, switch_export_to_p2p,
-    switch_import_to_p2p,
-};
+use crate::client::{join_session, open_quic, open_tcp, run_export, run_import, switch_to_p2p_udp};
 use crate::protocol::Role;
-use crate::relay::{run_quic, run_tcp};
+use crate::relay::{run_quic, run_tcp, run_udp_discovery};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Transport {
@@ -57,6 +56,9 @@ enum Cmd {
         /// Generate dev cert/key if missing (QUIC only).
         #[arg(long, default_value_t = false)]
         auto_tls: bool,
+        /// UDP endpoint used by peers to discover their NAT-mapped p2p address.
+        #[arg(long, default_value = "0.0.0.0:7845")]
+        p2p_discovery_listen: SocketAddr,
     },
     /// Side that has the private service (connects relay to `127.0.0.1:port`, etc.).
     Export {
@@ -88,6 +90,12 @@ enum Cmd {
         /// Timeout for establishing direct p2p path in seconds.
         #[arg(long, default_value_t = 15)]
         p2p_timeout_secs: u64,
+        /// Local UDP bind for p2p hole punching.
+        #[arg(long, default_value = "0.0.0.0:0")]
+        p2p_bind: SocketAddr,
+        /// Relay UDP discovery endpoint. Defaults to relay IP and relay port + 1.
+        #[arg(long)]
+        p2p_discovery_server: Option<SocketAddr>,
     },
     /// Side that exposes a local TCP (and optional UDP) listener tunneled to export.
     Import {
@@ -110,16 +118,24 @@ enum Cmd {
         /// Data path between peers after signaling.
         #[arg(long, value_enum, default_value_t = DataPath::Relay)]
         data_path: DataPath,
-        /// Local socket to accept direct p2p connection from export.
-        #[arg(long)]
-        p2p_listen: Option<SocketAddr>,
-        /// Address advertised over relay signaling for p2p.
-        #[arg(long)]
-        p2p_advertise: Option<SocketAddr>,
         /// Timeout for establishing direct p2p path in seconds.
         #[arg(long, default_value_t = 15)]
         p2p_timeout_secs: u64,
+        /// Local UDP bind for p2p hole punching.
+        #[arg(long, default_value = "0.0.0.0:0")]
+        p2p_bind: SocketAddr,
+        /// Relay UDP discovery endpoint. Defaults to relay IP and relay port + 1.
+        #[arg(long)]
+        p2p_discovery_server: Option<SocketAddr>,
     },
+}
+
+fn default_p2p_discovery_server(server: SocketAddr) -> Result<SocketAddr> {
+    let port = server
+        .port()
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("cannot derive p2p discovery port from {}", server.port()))?;
+    Ok(SocketAddr::new(server.ip(), port))
 }
 
 #[tokio::main]
@@ -136,8 +152,14 @@ async fn main() -> Result<()> {
             cert,
             key,
             auto_tls,
+            p2p_discovery_listen,
         } => {
             let sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+            tokio::spawn(async move {
+                if let Err(e) = run_udp_discovery(p2p_discovery_listen).await {
+                    error!("p2p udp discovery server stopped: {e:#}");
+                }
+            });
             match transport {
                 Transport::Tcp => run_tcp(listen, sessions).await?,
                 Transport::Quic => {
@@ -158,6 +180,8 @@ async fn main() -> Result<()> {
             server_name,
             data_path,
             p2p_timeout_secs,
+            p2p_bind,
+            p2p_discovery_server,
         } => {
             let want_udp = udp_target.is_some();
             let relay_tunnel = match transport {
@@ -172,7 +196,13 @@ async fn main() -> Result<()> {
             join_session(&relay_tunnel, &session, Role::Export, want_udp).await?;
             let tunnel = match data_path {
                 DataPath::Relay => relay_tunnel,
-                DataPath::P2p => switch_export_to_p2p(relay_tunnel, p2p_timeout_secs).await?,
+                DataPath::P2p => {
+                    let discovery_server = p2p_discovery_server
+                        .map(Ok)
+                        .unwrap_or_else(|| default_p2p_discovery_server(server))?;
+                    switch_to_p2p_udp(relay_tunnel, p2p_bind, discovery_server, p2p_timeout_secs)
+                        .await?
+                }
             };
             run_export(tunnel, to, udp_target).await?;
         }
@@ -186,9 +216,9 @@ async fn main() -> Result<()> {
             trust_cert,
             server_name,
             data_path,
-            p2p_listen,
-            p2p_advertise,
             p2p_timeout_secs,
+            p2p_bind,
+            p2p_discovery_server,
         } => {
             let want_udp = udp_listen.is_some();
             let relay_tunnel = match transport {
@@ -204,9 +234,10 @@ async fn main() -> Result<()> {
             let tunnel = match data_path {
                 DataPath::Relay => relay_tunnel,
                 DataPath::P2p => {
-                    let listen_addr = p2p_listen
-                        .ok_or_else(|| anyhow!("--p2p-listen is required with --data-path p2p"))?;
-                    switch_import_to_p2p(relay_tunnel, listen_addr, p2p_advertise, p2p_timeout_secs)
+                    let discovery_server = p2p_discovery_server
+                        .map(Ok)
+                        .unwrap_or_else(|| default_p2p_discovery_server(server))?;
+                    switch_to_p2p_udp(relay_tunnel, p2p_bind, discovery_server, p2p_timeout_secs)
                         .await?
                 }
             };
